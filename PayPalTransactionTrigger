@@ -87,9 +87,14 @@ trigger PayPalTransactionTrigger on sptc__PayPal_Transaction__c (after insert) {
                 acctName = 'Unknown';
             }
 
+            Id hhRecTypeId = Schema.SObjectType.Account
+                .getRecordTypeInfosByName()
+                .get('Household Account')
+                .getRecordTypeId();
+
             Account newAcct = new Account(
                 Name              = acctName,
-                Type              = 'Household Account',
+                RecordTypeId      = hhRecTypeId,
                 BillingStreet     = pt.sptc__Billing_Address_Street__c,
                 BillingCity       = pt.sptc__Billing_Address_City__c,
                 BillingPostalCode = pt.sptc__Billing_Address_PostalCode__c,
@@ -111,21 +116,19 @@ trigger PayPalTransactionTrigger on sptc__PayPal_Transaction__c (after insert) {
     }
 
     // ── Step 5: Resolve primary Contact for every resolved Account ───────────
-    // "Primary" = first Contact by CreatedDate on the Account.
-    // For NPSP orgs the query can be extended with npe01__Primary_Contact__c = true.
+    // Use NPSP's npe01__One2OneContact__c to get the primary Contact directly
+    // from the Account record.
     Set<Id> allAccountIds = new Set<Id>(transactionToAccountId.values());
     Map<Id, Id> accountToPrimaryContactId = new Map<Id, Id>();
 
     if (!allAccountIds.isEmpty()) {
-        for (Contact c : [
-            SELECT Id, AccountId
-            FROM   Contact
-            WHERE  AccountId IN :allAccountIds
-            ORDER BY CreatedDate ASC
+        for (Account a : [
+            SELECT Id, npe01__One2OneContact__c
+            FROM   Account
+            WHERE  Id IN :allAccountIds
+            AND    npe01__One2OneContact__c != null
         ]) {
-            if (!accountToPrimaryContactId.containsKey(c.AccountId)) {
-                accountToPrimaryContactId.put(c.AccountId, c.Id);
-            }
+            accountToPrimaryContactId.put(a.Id, a.npe01__One2OneContact__c);
         }
     }
 
