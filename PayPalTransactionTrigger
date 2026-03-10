@@ -33,11 +33,13 @@ trigger PayPalTransactionTrigger on sptc__PayPal_Transaction__c (after insert) {
 
     // ── Step 3: Search existing Accounts by Last Name + Billing Street ───────
     // Keyed as "lastname|billingstreet" (both lower-cased).
-    Map<String, Id> nameAddressToAccountId = new Map<String, Id>();
+    // Also capture the existing Contact's FirstName to detect a mismatch.
+    Map<String, Id>     nameAddressToAccountId = new Map<String, Id>();
+    Map<String, String> nameAddressToFirstName  = new Map<String, String>();
 
     if (!lastNames.isEmpty()) {
         for (Contact c : [
-            SELECT Id, AccountId, LastName, Account.BillingStreet
+            SELECT Id, AccountId, LastName, FirstName, Account.BillingStreet
             FROM   Contact
             WHERE  LastName IN :lastNames
             AND    AccountId != null
@@ -47,6 +49,7 @@ trigger PayPalTransactionTrigger on sptc__PayPal_Transaction__c (after insert) {
                          c.Account.BillingStreet.toLowerCase();
             if (!nameAddressToAccountId.containsKey(key)) {
                 nameAddressToAccountId.put(key, c.AccountId);
+                nameAddressToFirstName.put(key, c.FirstName);
             }
         }
     }
@@ -55,6 +58,10 @@ trigger PayPalTransactionTrigger on sptc__PayPal_Transaction__c (after insert) {
     Map<Id, Id>      transactionToAccountId       = new Map<Id, Id>();
     List<Account>    accountsToInsert             = new List<Account>();
     Map<Id, Integer> transactionToNewAccountIndex = new Map<Id, Integer>();
+
+    // Tracks transactions that matched by last name + street but with a
+    // different first name — these need a new Contact on the matched Account.
+    Set<Id> transactionsNeedingNewContact = new Set<Id>();
 
     // Resolve Record Type once, outside the loop
     Id hhRecTypeId = Schema.SObjectType.Account
@@ -76,6 +83,16 @@ trigger PayPalTransactionTrigger on sptc__PayPal_Transaction__c (after insert) {
                     ? pt.sptc__Billing_Address_Street__c.toLowerCase()
                     : '');
             foundAccountId = nameAddressToAccountId.get(key);
+
+            // If matched, check whether the incoming first name differs from
+            // the existing Contact's first name on this Account.
+            if (foundAccountId != null && String.isNotBlank(pt.sptc__First_Name__c)) {
+                String existingFirst = nameAddressToFirstName.get(key);
+                if (existingFirst == null ||
+                        !pt.sptc__First_Name__c.equalsIgnoreCase(existingFirst)) {
+                    transactionsNeedingNewContact.add(pt.Id);
+                }
+            }
         }
 
         if (foundAccountId != null) {
@@ -116,6 +133,42 @@ trigger PayPalTransactionTrigger on sptc__PayPal_Transaction__c (after insert) {
         }
     }
 
+    // ── Step 4.5: Create new Contacts for first-name-mismatch matches ─────────
+    // The Account matched by last name + street but the incoming first name
+    // is different.  Insert a new Contact on that Account without touching
+    // npe01__One2OneContact__c (so the Account's primary contact is unchanged).
+    List<Contact>    newContactsToInsert     = new List<Contact>();
+    Map<Id, Integer> transactionToNewConIdx  = new Map<Id, Integer>();
+
+    for (sptc__PayPal_Transaction__c pt : Trigger.new) {
+        if (!transactionsNeedingNewContact.contains(pt.Id)) continue;
+
+        Id accountId = transactionToAccountId.get(pt.Id);
+        if (accountId == null) continue;
+
+        transactionToNewConIdx.put(pt.Id, newContactsToInsert.size());
+        newContactsToInsert.add(new Contact(
+            AccountId         = accountId,
+            FirstName         = pt.sptc__First_Name__c,
+            LastName          = String.isNotBlank(pt.sptc__Last_Name__c)
+                                    ? pt.sptc__Last_Name__c : 'Unknown',
+            Email             = pt.sptc__Email__c,
+            MailingStreet     = pt.sptc__Billing_Address_Street__c,
+            MailingCity       = pt.sptc__Billing_Address_City__c,
+            MailingPostalCode = pt.sptc__Billing_Address_PostalCode__c,
+            MailingState      = pt.sptc__Billing_Address_StateCode__c
+        ));
+    }
+
+    Map<Id, Id> transactionToNewContactId = new Map<Id, Id>();
+    if (!newContactsToInsert.isEmpty()) {
+        insert newContactsToInsert;
+        for (Id transId : transactionToNewConIdx.keySet()) {
+            Integer idx = transactionToNewConIdx.get(transId);
+            transactionToNewContactId.put(transId, newContactsToInsert[idx].Id);
+        }
+    }
+
     // ── Step 5: Resolve primary Contact for every resolved Account ───────────
     // Use NPSP's npe01__One2OneContact__c to get the primary Contact directly
     // from the Account record.
@@ -134,15 +187,20 @@ trigger PayPalTransactionTrigger on sptc__PayPal_Transaction__c (after insert) {
     }
 
     // ── Step 6: Build Opportunities and Transaction updates ──────────────────
-    List<Opportunity>                  oppsToInsert        = new List<Opportunity>();
+    List<Opportunity>                  oppsToInsert         = new List<Opportunity>();
     List<sptc__PayPal_Transaction__c>  transactionsToUpdate = new List<sptc__PayPal_Transaction__c>();
+    List<Id>                           oppTransactionIds    = new List<Id>(); // parallel to oppsToInsert
 
     for (sptc__PayPal_Transaction__c pt : Trigger.new) {
 
         Id accountId = transactionToAccountId.get(pt.Id);
         if (accountId == null) continue;   // should not happen, but guard anyway
 
-        Id contactId = accountToPrimaryContactId.get(accountId); // may be null for new accounts
+        // For first-name-mismatch transactions use the newly created Contact;
+        // otherwise fall back to the Account's existing primary Contact.
+        Id contactId = transactionToNewContactId.containsKey(pt.Id)
+            ? transactionToNewContactId.get(pt.Id)
+            : accountToPrimaryContactId.get(accountId);
 
         // Stamp Account and Contact back onto the transaction record
         transactionsToUpdate.add(new sptc__PayPal_Transaction__c(
@@ -161,6 +219,7 @@ trigger PayPalTransactionTrigger on sptc__PayPal_Transaction__c (after insert) {
             ? pt.sptc__Transaction_Date__c
             : Date.today();
 
+        oppTransactionIds.add(pt.Id);
         oppsToInsert.add(new Opportunity(
             Name                       = oppName,
             AccountId                  = accountId,
@@ -173,6 +232,29 @@ trigger PayPalTransactionTrigger on sptc__PayPal_Transaction__c (after insert) {
 
     if (!oppsToInsert.isEmpty()) {
         insert oppsToInsert;
+    }
+
+    // ── Step 6.5: Mark new Contacts as primary on their Opportunity ───────────
+    // For first-name-mismatch transactions, create an OpportunityContactRole
+    // with IsPrimary = true for the new Contact.  The Account's primary Contact
+    // (npe01__One2OneContact__c) is left untouched.
+    List<OpportunityContactRole> ocrsToInsert = new List<OpportunityContactRole>();
+
+    for (Integer i = 0; i < oppsToInsert.size(); i++) {
+        Id transId  = oppTransactionIds[i];
+        Id newConId = transactionToNewContactId.get(transId);
+        if (newConId == null) continue;
+
+        ocrsToInsert.add(new OpportunityContactRole(
+            OpportunityId = oppsToInsert[i].Id,
+            ContactId     = newConId,
+            Role          = 'Decision Maker',
+            IsPrimary     = true
+        ));
+    }
+
+    if (!ocrsToInsert.isEmpty()) {
+        insert ocrsToInsert;
     }
 
     if (!transactionsToUpdate.isEmpty()) {
