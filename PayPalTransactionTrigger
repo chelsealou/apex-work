@@ -56,6 +56,12 @@ trigger PayPalTransactionTrigger on sptc__PayPal_Transaction__c (after insert) {
     List<Account>    accountsToInsert             = new List<Account>();
     Map<Id, Integer> transactionToNewAccountIndex = new Map<Id, Integer>();
 
+    // Resolve Record Type once, outside the loop
+    Id hhRecTypeId = Schema.SObjectType.Account
+        .getRecordTypeInfosByName()
+        .get('Household Account')
+        .getRecordTypeId();
+
     for (sptc__PayPal_Transaction__c pt : Trigger.new) {
 
         // 4a. Try email lookup
@@ -86,11 +92,6 @@ trigger PayPalTransactionTrigger on sptc__PayPal_Transaction__c (after insert) {
             } else {
                 acctName = 'Unknown';
             }
-
-            Id hhRecTypeId = Schema.SObjectType.Account
-                .getRecordTypeInfosByName()
-                .get('Household Account')
-                .getRecordTypeId();
 
             Account newAcct = new Account(
                 Name              = acctName,
