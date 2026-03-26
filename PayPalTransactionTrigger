@@ -1,0 +1,263 @@
+trigger PayPalTransactionTrigger on sptc__PayPal_Transaction__c (after insert) {
+
+    // ── Step 1: Collect lookup values from all incoming transactions ─────────
+    Set<String> emails      = new Set<String>();
+    Set<String> lastNames   = new Set<String>();
+
+    for (sptc__PayPal_Transaction__c pt : Trigger.new) {
+        if (String.isNotBlank(pt.sptc__Email__c)) {
+            emails.add(pt.sptc__Email__c.toLowerCase());
+        }
+        if (String.isNotBlank(pt.sptc__Last_Name__c)) {
+            lastNames.add(pt.sptc__Last_Name__c);
+        }
+    }
+
+    // ── Step 2: Search existing Accounts by email (via Contact.Email) ────────
+    // Household Accounts carry the donor email on their related Contact record.
+    Map<String, Id> emailToAccountId = new Map<String, Id>();
+
+    if (!emails.isEmpty()) {
+        for (Contact c : [
+            SELECT Id, AccountId, Email
+            FROM   Contact
+            WHERE  Email IN :emails
+            AND    AccountId != null
+        ]) {
+            String emailKey = c.Email.toLowerCase();
+            if (!emailToAccountId.containsKey(emailKey)) {
+                emailToAccountId.put(emailKey, c.AccountId);
+            }
+        }
+    }
+
+    // ── Step 3: Search existing Accounts by Last Name + Billing Street ───────
+    // Keyed as "lastname|billingstreet" (both lower-cased).
+    // Also capture the existing Contact's FirstName to detect a mismatch.
+    Map<String, Id>     nameAddressToAccountId = new Map<String, Id>();
+    Map<String, String> nameAddressToFirstName  = new Map<String, String>();
+
+    if (!lastNames.isEmpty()) {
+        for (Contact c : [
+            SELECT Id, AccountId, LastName, FirstName, Account.BillingStreet
+            FROM   Contact
+            WHERE  LastName IN :lastNames
+            AND    AccountId != null
+            AND    Account.BillingStreet != null
+        ]) {
+            String key = c.LastName.toLowerCase() + '|' +
+                         c.Account.BillingStreet.toLowerCase();
+            if (!nameAddressToAccountId.containsKey(key)) {
+                nameAddressToAccountId.put(key, c.AccountId);
+                nameAddressToFirstName.put(key, c.FirstName);
+            }
+        }
+    }
+
+    // ── Step 4: Resolve Account for each transaction; stage new ones ─────────
+    Map<Id, Id>      transactionToAccountId       = new Map<Id, Id>();
+    List<Account>    accountsToInsert             = new List<Account>();
+    Map<Id, Integer> transactionToNewAccountIndex = new Map<Id, Integer>();
+
+    // Tracks transactions that matched by last name + street but with a
+    // different first name — these need a new Contact on the matched Account.
+    Set<Id> transactionsNeedingNewContact = new Set<Id>();
+
+    // Resolve Record Type once, outside the loop
+    Id hhRecTypeId = Schema.SObjectType.Account
+        .getRecordTypeInfosByName()
+        .get('Household Account')
+        .getRecordTypeId();
+
+    for (sptc__PayPal_Transaction__c pt : Trigger.new) {
+
+        // 4a. Try email lookup
+        Id foundAccountId = String.isNotBlank(pt.sptc__Email__c)
+            ? emailToAccountId.get(pt.sptc__Email__c.toLowerCase())
+            : null;
+
+        // 4b. Try Last Name + Billing Street lookup
+        if (foundAccountId == null && String.isNotBlank(pt.sptc__Last_Name__c)) {
+            String key = pt.sptc__Last_Name__c.toLowerCase() + '|' +
+                (String.isNotBlank(pt.sptc__Billing_Address_Street__c)
+                    ? pt.sptc__Billing_Address_Street__c.toLowerCase()
+                    : '');
+            foundAccountId = nameAddressToAccountId.get(key);
+
+            // If matched, check whether the incoming first name differs from
+            // the existing Contact's first name on this Account.
+            if (foundAccountId != null && String.isNotBlank(pt.sptc__First_Name__c)) {
+                String existingFirst = nameAddressToFirstName.get(key);
+                if (existingFirst == null ||
+                        !pt.sptc__First_Name__c.equalsIgnoreCase(existingFirst)) {
+                    transactionsNeedingNewContact.add(pt.Id);
+                }
+            }
+        }
+
+        if (foundAccountId != null) {
+            transactionToAccountId.put(pt.Id, foundAccountId);
+        } else {
+            // 4c. Build a new Household Account
+            String acctName;
+            if (String.isNotBlank(pt.sptc__First_Name__c) && String.isNotBlank(pt.sptc__Last_Name__c)) {
+                acctName = pt.sptc__First_Name__c + ' ' + pt.sptc__Last_Name__c;
+            } else if (String.isNotBlank(pt.sptc__Last_Name__c)) {
+                acctName = pt.sptc__Last_Name__c;
+            } else if (String.isNotBlank(pt.sptc__First_Name__c)) {
+                acctName = pt.sptc__First_Name__c;
+            } else {
+                acctName = 'Unknown';
+            }
+
+            Account newAcct = new Account(
+                Name              = acctName,
+                RecordTypeId      = hhRecTypeId,
+                BillingStreet     = pt.sptc__Billing_Address_Street__c,
+                BillingCity       = pt.sptc__Billing_Address_City__c,
+                BillingPostalCode = pt.sptc__Billing_Address_PostalCode__c,
+                BillingState      = pt.sptc__Billing_Address_StateCode__c
+            );
+
+            transactionToNewAccountIndex.put(pt.Id, accountsToInsert.size());
+            accountsToInsert.add(newAcct);
+        }
+    }
+
+    // Insert any new Accounts and wire their fresh IDs back to transactions
+    if (!accountsToInsert.isEmpty()) {
+        insert accountsToInsert;
+        for (Id transId : transactionToNewAccountIndex.keySet()) {
+            Integer idx = transactionToNewAccountIndex.get(transId);
+            transactionToAccountId.put(transId, accountsToInsert[idx].Id);
+        }
+    }
+
+    // ── Step 4.5: Create new Contacts for first-name-mismatch matches ─────────
+    // The Account matched by last name + street but the incoming first name
+    // is different.  Insert a new Contact on that Account without touching
+    // npe01__One2OneContact__c (so the Account's primary contact is unchanged).
+    List<Contact>    newContactsToInsert     = new List<Contact>();
+    Map<Id, Integer> transactionToNewConIdx  = new Map<Id, Integer>();
+
+    for (sptc__PayPal_Transaction__c pt : Trigger.new) {
+        if (!transactionsNeedingNewContact.contains(pt.Id)) continue;
+
+        Id accountId = transactionToAccountId.get(pt.Id);
+        if (accountId == null) continue;
+
+        transactionToNewConIdx.put(pt.Id, newContactsToInsert.size());
+        newContactsToInsert.add(new Contact(
+            AccountId         = accountId,
+            FirstName         = pt.sptc__First_Name__c,
+            LastName          = String.isNotBlank(pt.sptc__Last_Name__c)
+                                    ? pt.sptc__Last_Name__c : 'Unknown',
+            Email             = pt.sptc__Email__c,
+            MailingStreet     = pt.sptc__Billing_Address_Street__c,
+            MailingCity       = pt.sptc__Billing_Address_City__c,
+            MailingPostalCode = pt.sptc__Billing_Address_PostalCode__c,
+            MailingState      = pt.sptc__Billing_Address_StateCode__c
+        ));
+    }
+
+    Map<Id, Id> transactionToNewContactId = new Map<Id, Id>();
+    if (!newContactsToInsert.isEmpty()) {
+        insert newContactsToInsert;
+        for (Id transId : transactionToNewConIdx.keySet()) {
+            Integer idx = transactionToNewConIdx.get(transId);
+            transactionToNewContactId.put(transId, newContactsToInsert[idx].Id);
+        }
+    }
+
+    // ── Step 5: Resolve primary Contact for every resolved Account ───────────
+    // Use NPSP's npe01__One2OneContact__c to get the primary Contact directly
+    // from the Account record.
+    Set<Id> allAccountIds = new Set<Id>(transactionToAccountId.values());
+    Map<Id, Id> accountToPrimaryContactId = new Map<Id, Id>();
+
+    if (!allAccountIds.isEmpty()) {
+        for (Account a : [
+            SELECT Id, npe01__One2OneContact__c
+            FROM   Account
+            WHERE  Id IN :allAccountIds
+            AND    npe01__One2OneContact__c != null
+        ]) {
+            accountToPrimaryContactId.put(a.Id, a.npe01__One2OneContact__c);
+        }
+    }
+
+    // ── Step 6: Build Opportunities and Transaction updates ──────────────────
+    List<Opportunity>                  oppsToInsert         = new List<Opportunity>();
+    List<sptc__PayPal_Transaction__c>  transactionsToUpdate = new List<sptc__PayPal_Transaction__c>();
+    List<Id>                           oppTransactionIds    = new List<Id>(); // parallel to oppsToInsert
+
+    for (sptc__PayPal_Transaction__c pt : Trigger.new) {
+
+        Id accountId = transactionToAccountId.get(pt.Id);
+        if (accountId == null) continue;   // should not happen, but guard anyway
+
+        // For first-name-mismatch transactions use the newly created Contact;
+        // otherwise fall back to the Account's existing primary Contact.
+        Id contactId = transactionToNewContactId.containsKey(pt.Id)
+            ? transactionToNewContactId.get(pt.Id)
+            : accountToPrimaryContactId.get(accountId);
+
+        // Stamp Account and Contact back onto the transaction record
+        transactionsToUpdate.add(new sptc__PayPal_Transaction__c(
+            Id               = pt.Id,
+            sptc__Account__c = accountId,
+            sptc__Contact__c = contactId
+        ));
+
+        // Build the Opportunity
+        String oppName = String.isNotBlank(pt.sptc__Transaction_ID__c)
+            ? 'PayPal Transaction - ' + pt.sptc__Transaction_ID__c
+            : 'PayPal Transaction - ' + pt.Id;
+
+        // CloseDate is required; fall back to today if the transaction date is blank
+        Date closeDate = pt.sptc__Transaction_Date__c != null
+            ? pt.sptc__Transaction_Date__c
+            : Date.today();
+
+        oppTransactionIds.add(pt.Id);
+        oppsToInsert.add(new Opportunity(
+            Name                       = oppName,
+            AccountId                  = accountId,
+            Amount                     = pt.sptc__Transaction_Amount__c,
+            CloseDate                  = closeDate,
+            StageName                  = 'Closed Won',
+            Transaction_Reference_ID__c = pt.sptc__Transaction_ID__c
+        ));
+    }
+
+    if (!oppsToInsert.isEmpty()) {
+        insert oppsToInsert;
+    }
+
+    // ── Step 6.5: Mark new Contacts as primary on their Opportunity ───────────
+    // For first-name-mismatch transactions, create an OpportunityContactRole
+    // with IsPrimary = true for the new Contact.  The Account's primary Contact
+    // (npe01__One2OneContact__c) is left untouched.
+    List<OpportunityContactRole> ocrsToInsert = new List<OpportunityContactRole>();
+
+    for (Integer i = 0; i < oppsToInsert.size(); i++) {
+        Id transId  = oppTransactionIds[i];
+        Id newConId = transactionToNewContactId.get(transId);
+        if (newConId == null) continue;
+
+        ocrsToInsert.add(new OpportunityContactRole(
+            OpportunityId = oppsToInsert[i].Id,
+            ContactId     = newConId,
+            Role          = 'Decision Maker',
+            IsPrimary     = true
+        ));
+    }
+
+    if (!ocrsToInsert.isEmpty()) {
+        insert ocrsToInsert;
+    }
+
+    if (!transactionsToUpdate.isEmpty()) {
+        update transactionsToUpdate;
+    }
+}
