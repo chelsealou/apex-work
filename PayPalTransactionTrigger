@@ -133,15 +133,20 @@ trigger PayPalTransactionTrigger on sptc__PayPal_Transaction__c (after insert) {
         }
     }
 
-    // ── Step 4.5: Create new Contacts for first-name-mismatch matches ─────────
-    // The Account matched by last name + street but the incoming first name
-    // is different.  Insert a new Contact on that Account without touching
-    // npe01__One2OneContact__c (so the Account's primary contact is unchanged).
+    // ── Step 4.5: Create Contacts where needed ────────────────────────────────
+    // Two cases require a new Contact at this point:
+    //   (a) Brand-new Account — no Contact exists yet; create one so NPSP can
+    //       establish the household relationship (Account first, then Contact).
+    //   (b) Name-mismatch on an existing Account — different first name on the
+    //       same last name + street; add the new person without changing the
+    //       Account's primary Contact (npe01__One2OneContact__c).
     List<Contact>    newContactsToInsert     = new List<Contact>();
     Map<Id, Integer> transactionToNewConIdx  = new Map<Id, Integer>();
 
     for (sptc__PayPal_Transaction__c pt : Trigger.new) {
-        if (!transactionsNeedingNewContact.contains(pt.Id)) continue;
+        Boolean isNewAccount = transactionToNewAccountIndex.containsKey(pt.Id);
+        Boolean isMismatch   = transactionsNeedingNewContact.contains(pt.Id);
+        if (!isNewAccount && !isMismatch) continue;
 
         Id accountId = transactionToAccountId.get(pt.Id);
         if (accountId == null) continue;
@@ -234,14 +239,15 @@ trigger PayPalTransactionTrigger on sptc__PayPal_Transaction__c (after insert) {
         insert oppsToInsert;
     }
 
-    // ── Step 6.5: Mark new Contacts as primary on their Opportunity ───────────
-    // For first-name-mismatch transactions, create an OpportunityContactRole
-    // with IsPrimary = true for the new Contact.  The Account's primary Contact
-    // (npe01__One2OneContact__c) is left untouched.
+    // ── Step 6.5: Mark mismatch Contacts as primary on their Opportunity ──────
+    // New-account Contacts are the household primary — no OCR override needed.
+    // Mismatch Contacts are a different person on an existing Account and must
+    // be designated primary on their specific Opportunity only.
     List<OpportunityContactRole> ocrsToInsert = new List<OpportunityContactRole>();
 
     for (Integer i = 0; i < oppsToInsert.size(); i++) {
-        Id transId  = oppTransactionIds[i];
+        Id transId = oppTransactionIds[i];
+        if (!transactionsNeedingNewContact.contains(transId)) continue;
         Id newConId = transactionToNewContactId.get(transId);
         if (newConId == null) continue;
 
