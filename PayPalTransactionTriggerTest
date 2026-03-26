@@ -171,7 +171,7 @@ private class PayPalTransactionTriggerTest {
         System.assertEquals(true, ocrs[0].IsPrimary, 'OCR should be marked primary');
     }
 
-    // ── Test 4: No match at all → new Household Account created ──────────────
+    // ── Test 4: No match at all → new Household Account + Contact created ─────
     @IsTest
     static void testNoMatch_createsNewAccount() {
         Test.startTest();
@@ -180,7 +180,7 @@ private class PayPalTransactionTriggerTest {
         Test.stopTest();
 
         sptc__PayPal_Transaction__c result = [
-            SELECT sptc__Account__c FROM sptc__PayPal_Transaction__c WHERE Id = :tx.Id
+            SELECT sptc__Account__c, sptc__Contact__c FROM sptc__PayPal_Transaction__c WHERE Id = :tx.Id
         ];
         System.assertNotEquals(null, result.sptc__Account__c, 'A new Account should have been created');
 
@@ -192,6 +192,13 @@ private class PayPalTransactionTriggerTest {
         List<Opportunity> opps = [SELECT Amount FROM Opportunity WHERE AccountId = :newAcct.Id];
         System.assertEquals(1, opps.size(), 'One Opportunity should be created');
         System.assertEquals(200, opps[0].Amount, 'Opportunity amount should match the transaction amount');
+
+        // A Contact should have been created on the new Account
+        Contact con = [SELECT FirstName, LastName, Email FROM Contact WHERE AccountId = :newAcct.Id];
+        System.assertEquals('Carol', con.FirstName, 'Contact first name should come from the transaction');
+        System.assertEquals('Taylor', con.LastName, 'Contact last name should come from the transaction');
+        System.assertEquals('carol.taylor@example.com', con.Email, 'Contact email should come from the transaction');
+        System.assertEquals(con.Id, result.sptc__Contact__c, 'Transaction Contact lookup should point to the new Contact');
     }
 
     // ── Test 5: Opportunity fields populated correctly ────────────────────────
@@ -268,6 +275,9 @@ private class PayPalTransactionTriggerTest {
         sptc__PayPal_Transaction__c result = [SELECT sptc__Account__c FROM sptc__PayPal_Transaction__c WHERE Id = :tx.Id];
         Account acct = [SELECT Name FROM Account WHERE Id = :result.sptc__Account__c];
         System.assertEquals('OnlyLast', acct.Name, 'Account name should be last name only when first name is blank');
+
+        Contact con = [SELECT LastName FROM Contact WHERE AccountId = :acct.Id];
+        System.assertEquals('OnlyLast', con.LastName, 'Contact should be created on the new Account');
     }
 
     // ── Test 8: No match, first name only → Account named by first name ───────
@@ -290,9 +300,14 @@ private class PayPalTransactionTriggerTest {
         sptc__PayPal_Transaction__c result = [SELECT sptc__Account__c FROM sptc__PayPal_Transaction__c WHERE Id = :tx.Id];
         Account acct = [SELECT Name FROM Account WHERE Id = :result.sptc__Account__c];
         System.assertEquals('OnlyFirst', acct.Name, 'Account name should be first name only when last name is blank');
+
+        // Contact LastName falls back to 'Unknown' when last name is blank
+        Contact con = [SELECT FirstName, LastName FROM Contact WHERE AccountId = :acct.Id];
+        System.assertEquals('OnlyFirst', con.FirstName, 'Contact first name should come from the transaction');
+        System.assertEquals('Unknown', con.LastName, 'Contact last name should fall back to Unknown');
     }
 
-    // ── Test 9: No match, no name → Account named "Unknown" ──────────────────
+    // ── Test 9: No match, no name → Account named "Unknown", Contact LastName "Unknown"
     @IsTest
     static void testNoMatch_noName_accountNamedUnknown() {
         Test.startTest();
@@ -312,6 +327,9 @@ private class PayPalTransactionTriggerTest {
         sptc__PayPal_Transaction__c result = [SELECT sptc__Account__c FROM sptc__PayPal_Transaction__c WHERE Id = :tx.Id];
         Account acct = [SELECT Name FROM Account WHERE Id = :result.sptc__Account__c];
         System.assertEquals('Unknown', acct.Name, 'Account name should be Unknown when both names are blank');
+
+        Contact con = [SELECT LastName FROM Contact WHERE AccountId = :acct.Id];
+        System.assertEquals('Unknown', con.LastName, 'Contact last name should fall back to Unknown');
     }
 
     // ── Test 10: Name+address match, transaction has no first name → no new Contact
