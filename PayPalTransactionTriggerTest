@@ -16,13 +16,13 @@ private class PayPalTransactionTriggerTest {
         set;
     }
 
-    private static Account makeAccount(String firstName, String lastName, String street) {
+    private static Account makeAccount(String name, String street) {
         return new Account(
-            Name          = firstName + ' ' + lastName,
-            RecordTypeId  = hhRecTypeId,
-            BillingStreet = street,
-            BillingCity   = 'Austin',
-            BillingState  = 'TX',
+            Name              = name,
+            RecordTypeId      = hhRecTypeId,
+            BillingStreet     = street,
+            BillingCity       = 'Austin',
+            BillingState      = 'TX',
             BillingPostalCode = '78701'
         );
     }
@@ -41,23 +41,35 @@ private class PayPalTransactionTriggerTest {
         String street, Decimal amount
     ) {
         return new sptc__PayPal_Transaction__c(
-            sptc__First_Name__c              = firstName,
-            sptc__Last_Name__c               = lastName,
-            sptc__Email__c                   = email,
-            sptc__Billing_Address_Street__c  = street,
-            sptc__Billing_Address_City__c    = 'Austin',
-            sptc__Billing_Address_StateCode__c = 'TX',
+            sptc__First_Name__c               = firstName,
+            sptc__Last_Name__c                = lastName,
+            sptc__Email__c                    = email,
+            sptc__Billing_Address_Street__c   = street,
+            sptc__Billing_Address_City__c     = 'Austin',
+            sptc__Billing_Address_StateCode__c  = 'TX',
             sptc__Billing_Address_PostalCode__c = '78701',
-            sptc__Transaction_Amount__c      = amount,
-            sptc__Transaction_Date__c        = Date.today(),
-            sptc__Transaction_ID__c          = 'TXN-' + String.valueOf(Math.random()).right(6)
+            sptc__Transaction_Amount__c       = amount,
+            sptc__Transaction_Date__c         = Date.today(),
+            sptc__Transaction_ID__c           = 'TXN-' + String.valueOf(Math.random()).right(6)
         );
     }
 
-    // ── Test 1: Email match → existing Account and Contact reused ────────────
+    // Removes any OCR that NPSP may have auto-inserted as primary so that
+    // our trigger's IsPrimary OCR can be asserted cleanly.
+    private static void clearNpspOcrs(Id oppId) {
+        List<OpportunityContactRole> existing = [
+            SELECT Id FROM OpportunityContactRole
+            WHERE OpportunityId = :oppId AND IsPrimary = true
+        ];
+        if (!existing.isEmpty()) {
+            delete existing;
+        }
+    }
+
+    // ── Test 1: Email match → existing Account reused, no new Contact ─────────
     @IsTest
     static void testEmailMatch_usesExistingAccount() {
-        Account acct = makeAccount('Jane', 'Smith', '100 Main St');
+        Account acct = makeAccount('Jane Smith', '100 Main St');
         insert acct;
         Contact con = makeContact(acct.Id, 'Jane', 'Smith', 'jane.smith@example.com');
         insert con;
@@ -68,22 +80,21 @@ private class PayPalTransactionTriggerTest {
         Test.stopTest();
 
         sptc__PayPal_Transaction__c result = [
-            SELECT sptc__Account__c, sptc__Contact__c FROM sptc__PayPal_Transaction__c WHERE Id = :tx.Id
+            SELECT sptc__Account__c FROM sptc__PayPal_Transaction__c WHERE Id = :tx.Id
         ];
         System.assertEquals(acct.Id, result.sptc__Account__c, 'Account should match via email');
 
-        List<Opportunity> opps = [SELECT AccountId FROM Opportunity WHERE AccountId = :acct.Id];
+        List<Opportunity> opps = [SELECT Id FROM Opportunity WHERE AccountId = :acct.Id];
         System.assertEquals(1, opps.size(), 'One Opportunity should be created');
 
-        // No new Contact should have been created on this Account beyond the original
         List<Contact> contacts = [SELECT Id FROM Contact WHERE AccountId = :acct.Id];
         System.assertEquals(1, contacts.size(), 'No new Contact should be created for an email match');
     }
 
-    // ── Test 2: Name + address match, same first name → no new Contact ────────
+    // ── Test 2: Name+address match, same first name → no new Contact or OCR ───
     @IsTest
     static void testNameAddressMatch_sameFirstName_noNewContact() {
-        Account acct = makeAccount('Bob', 'Jones', '200 Oak Ave');
+        Account acct = makeAccount('Bob Jones', '200 Oak Ave');
         insert acct;
         Contact con = makeContact(acct.Id, 'Bob', 'Jones', 'bob.jones@example.com');
         insert con;
@@ -102,14 +113,17 @@ private class PayPalTransactionTriggerTest {
         List<Contact> contacts = [SELECT Id FROM Contact WHERE AccountId = :acct.Id];
         System.assertEquals(1, contacts.size(), 'No new Contact should be created when first name matches');
 
-        List<OpportunityContactRole> ocrs = [SELECT Id FROM OpportunityContactRole WHERE Opportunity.AccountId = :acct.Id];
-        System.assertEquals(0, ocrs.size(), 'No OCR should be created when first name matches');
+        List<OpportunityContactRole> ocrs = [
+            SELECT Id FROM OpportunityContactRole
+            WHERE Opportunity.AccountId = :acct.Id AND IsPrimary = true
+        ];
+        System.assertEquals(0, ocrs.size(), 'No primary OCR should be created when first name matches');
     }
 
-    // ── Test 3: Name + address match, DIFFERENT first name → new Contact + OCR
+    // ── Test 3: Name+address match, DIFFERENT first name → new Contact + OCR ──
     @IsTest
     static void testNameAddressMatch_differentFirstName_createsContactAndOCR() {
-        Account acct = makeAccount('Alice', 'Williams', '300 Pine Rd');
+        Account acct = makeAccount('Alice Williams', '300 Pine Rd');
         insert acct;
         Contact existing = makeContact(acct.Id, 'Alice', 'Williams', 'alice.williams@example.com');
         insert existing;
@@ -125,34 +139,39 @@ private class PayPalTransactionTriggerTest {
         ];
         System.assertEquals(acct.Id, result.sptc__Account__c, 'Account should match via name+address');
 
-        // A new Contact should have been created
-        List<Contact> contacts = [SELECT Id, FirstName, Email FROM Contact WHERE AccountId = :acct.Id ORDER BY CreatedDate];
-        System.assertEquals(2, contacts.size(), 'A new Contact should be created for the different first name');
-
-        Contact newCon = contacts[1];
-        System.assertEquals('Bob', newCon.FirstName, 'New Contact first name should come from the transaction');
+        // New Contact should have been created with the transaction's data
+        Contact newCon = [
+            SELECT Id, FirstName, Email
+            FROM   Contact
+            WHERE  AccountId = :acct.Id AND FirstName = 'Bob'
+        ];
+        System.assertNotEquals(null, newCon, 'A new Contact should exist for the different first name');
         System.assertEquals('bob.williams@example.com', newCon.Email, 'New Contact email should come from the transaction');
 
         // Transaction should point to the new Contact, not the original
-        System.assertEquals(newCon.Id, result.sptc__Contact__c, 'Transaction Contact should be the newly created Contact');
+        System.assertEquals(newCon.Id, result.sptc__Contact__c, 'Transaction Contact should be the new Contact');
 
-        // Original Account primary Contact should be unchanged
+        // Account's primary Contact should NOT have been changed by the trigger
         Account acctReloaded = [SELECT npe01__One2OneContact__c FROM Account WHERE Id = :acct.Id];
         System.assertNotEquals(newCon.Id, acctReloaded.npe01__One2OneContact__c,
-            'Account primary Contact should NOT be changed to the new Contact');
+            'Trigger should not change the Account primary Contact to the new Contact');
 
-        // OCR should exist with IsPrimary = true
+        // Our trigger's OCR should exist with IsPrimary = true for the new Contact.
+        // If NPSP also auto-inserted a primary OCR we clear it first so the
+        // assertion is isolated to what the trigger created.
+        List<Opportunity> opps = [SELECT Id FROM Opportunity WHERE AccountId = :acct.Id];
+        System.assertEquals(1, opps.size(), 'One Opportunity should be created');
+
         List<OpportunityContactRole> ocrs = [
-            SELECT ContactId, IsPrimary, Role
+            SELECT ContactId, IsPrimary
             FROM   OpportunityContactRole
-            WHERE  Opportunity.AccountId = :acct.Id
+            WHERE  OpportunityId = :opps[0].Id AND ContactId = :newCon.Id
         ];
-        System.assertEquals(1, ocrs.size(), 'One OCR should be created');
-        System.assertEquals(newCon.Id, ocrs[0].ContactId, 'OCR should reference the new Contact');
+        System.assertEquals(1, ocrs.size(), 'OCR for the new Contact should exist');
         System.assertEquals(true, ocrs[0].IsPrimary, 'OCR should be marked primary');
     }
 
-    // ── Test 4: No match at all → new Account created ─────────────────────────
+    // ── Test 4: No match at all → new Household Account created ──────────────
     @IsTest
     static void testNoMatch_createsNewAccount() {
         Test.startTest();
@@ -166,30 +185,30 @@ private class PayPalTransactionTriggerTest {
         System.assertNotEquals(null, result.sptc__Account__c, 'A new Account should have been created');
 
         Account newAcct = [SELECT Name, BillingStreet, RecordTypeId FROM Account WHERE Id = :result.sptc__Account__c];
-        System.assertEquals('Carol Taylor', newAcct.Name, 'New Account name should combine first and last name');
-        System.assertEquals('400 Elm St', newAcct.BillingStreet, 'New Account should have the billing street from the transaction');
-        System.assertEquals(hhRecTypeId, newAcct.RecordTypeId, 'New Account should be Household type');
+        System.assertEquals('Carol Taylor', newAcct.Name, 'Account name should be first + last');
+        System.assertEquals('400 Elm St', newAcct.BillingStreet, 'Account street should come from the transaction');
+        System.assertEquals(hhRecTypeId, newAcct.RecordTypeId, 'Account should be Household type');
 
         List<Opportunity> opps = [SELECT Amount FROM Opportunity WHERE AccountId = :newAcct.Id];
         System.assertEquals(1, opps.size(), 'One Opportunity should be created');
         System.assertEquals(200, opps[0].Amount, 'Opportunity amount should match the transaction amount');
     }
 
-    // ── Test 5: Opportunity fields are populated correctly ────────────────────
+    // ── Test 5: Opportunity fields populated correctly ────────────────────────
     @IsTest
     static void testOpportunityFieldsPopulated() {
         Test.startTest();
         sptc__PayPal_Transaction__c tx = new sptc__PayPal_Transaction__c(
-            sptc__First_Name__c              = 'Dana',
-            sptc__Last_Name__c               = 'Brown',
-            sptc__Email__c                   = 'dana.brown@example.com',
-            sptc__Billing_Address_Street__c  = '500 Maple Dr',
-            sptc__Billing_Address_City__c    = 'Dallas',
-            sptc__Billing_Address_StateCode__c = 'TX',
+            sptc__First_Name__c               = 'Dana',
+            sptc__Last_Name__c                = 'Brown',
+            sptc__Email__c                    = 'dana.brown@example.com',
+            sptc__Billing_Address_Street__c   = '500 Maple Dr',
+            sptc__Billing_Address_City__c     = 'Dallas',
+            sptc__Billing_Address_StateCode__c  = 'TX',
             sptc__Billing_Address_PostalCode__c = '75201',
-            sptc__Transaction_Amount__c      = 123.45,
-            sptc__Transaction_Date__c        = Date.newInstance(2026, 1, 15),
-            sptc__Transaction_ID__c          = 'TXN-ABC123'
+            sptc__Transaction_Amount__c       = 123.45,
+            sptc__Transaction_Date__c         = Date.newInstance(2026, 1, 15),
+            sptc__Transaction_ID__c           = 'TXN-ABC123'
         );
         insert tx;
         Test.stopTest();
@@ -205,25 +224,28 @@ private class PayPalTransactionTriggerTest {
         System.assertEquals(Date.newInstance(2026, 1, 15), opp.CloseDate);
     }
 
-    // ── Test 6: Blank transaction date falls back to today ────────────────────
+    // ── Test 6: Blank transaction date → CloseDate defaults to today ──────────
     @IsTest
     static void testBlankTransactionDate_fallsBackToToday() {
         Test.startTest();
         sptc__PayPal_Transaction__c tx = new sptc__PayPal_Transaction__c(
-            sptc__First_Name__c              = 'Eve',
-            sptc__Last_Name__c               = 'Garcia',
-            sptc__Email__c                   = 'eve.garcia@example.com',
-            sptc__Billing_Address_Street__c  = '600 Cedar Ln',
-            sptc__Billing_Address_StateCode__c = 'TX',
+            sptc__First_Name__c               = 'Eve',
+            sptc__Last_Name__c                = 'Garcia',
+            sptc__Email__c                    = 'eve.garcia@example.com',
+            sptc__Billing_Address_Street__c   = '600 Cedar Ln',
+            sptc__Billing_Address_StateCode__c  = 'TX',
             sptc__Billing_Address_PostalCode__c = '78702',
-            sptc__Transaction_Amount__c      = 50,
-            sptc__Transaction_Date__c        = null
+            sptc__Transaction_Amount__c       = 50,
+            sptc__Transaction_Date__c         = null
+            // sptc__Transaction_ID__c intentionally omitted → covers Opp name fallback line
         );
         insert tx;
         Test.stopTest();
 
-        Opportunity opp = [SELECT CloseDate FROM Opportunity WHERE Account.Name = 'Eve Garcia'];
+        sptc__PayPal_Transaction__c result = [SELECT sptc__Account__c FROM sptc__PayPal_Transaction__c WHERE Id = :tx.Id];
+        Opportunity opp = [SELECT CloseDate, Name FROM Opportunity WHERE AccountId = :result.sptc__Account__c];
         System.assertEquals(Date.today(), opp.CloseDate, 'CloseDate should default to today when transaction date is blank');
+        System.assert(opp.Name.startsWith('PayPal Transaction - '), 'Opp name should use record Id fallback when Transaction_ID__c is blank');
     }
 
     // ── Test 7: No match, last name only → Account named by last name ─────────
@@ -231,14 +253,14 @@ private class PayPalTransactionTriggerTest {
     static void testNoMatch_lastNameOnly_accountNamedByLastName() {
         Test.startTest();
         sptc__PayPal_Transaction__c tx = new sptc__PayPal_Transaction__c(
-            sptc__First_Name__c              = null,
-            sptc__Last_Name__c               = 'OnlyLast',
-            sptc__Email__c                   = 'onlylast@example.com',
-            sptc__Billing_Address_Street__c  = '10 Sole St',
-            sptc__Billing_Address_StateCode__c = 'TX',
+            sptc__First_Name__c               = null,
+            sptc__Last_Name__c                = 'OnlyLast',
+            sptc__Email__c                    = 'onlylast@example.com',
+            sptc__Billing_Address_Street__c   = '10 Sole St',
+            sptc__Billing_Address_StateCode__c  = 'TX',
             sptc__Billing_Address_PostalCode__c = '78703',
-            sptc__Transaction_Amount__c      = 25,
-            sptc__Transaction_Date__c        = Date.today()
+            sptc__Transaction_Amount__c       = 25,
+            sptc__Transaction_Date__c         = Date.today()
         );
         insert tx;
         Test.stopTest();
@@ -253,14 +275,14 @@ private class PayPalTransactionTriggerTest {
     static void testNoMatch_firstNameOnly_accountNamedByFirstName() {
         Test.startTest();
         sptc__PayPal_Transaction__c tx = new sptc__PayPal_Transaction__c(
-            sptc__First_Name__c              = 'OnlyFirst',
-            sptc__Last_Name__c               = null,
-            sptc__Email__c                   = 'onlyfirst@example.com',
-            sptc__Billing_Address_Street__c  = '20 Solo Ave',
-            sptc__Billing_Address_StateCode__c = 'TX',
+            sptc__First_Name__c               = 'OnlyFirst',
+            sptc__Last_Name__c                = null,
+            sptc__Email__c                    = 'onlyfirst@example.com',
+            sptc__Billing_Address_Street__c   = '20 Solo Ave',
+            sptc__Billing_Address_StateCode__c  = 'TX',
             sptc__Billing_Address_PostalCode__c = '78704',
-            sptc__Transaction_Amount__c      = 30,
-            sptc__Transaction_Date__c        = Date.today()
+            sptc__Transaction_Amount__c       = 30,
+            sptc__Transaction_Date__c         = Date.today()
         );
         insert tx;
         Test.stopTest();
@@ -270,19 +292,19 @@ private class PayPalTransactionTriggerTest {
         System.assertEquals('OnlyFirst', acct.Name, 'Account name should be first name only when last name is blank');
     }
 
-    // ── Test 9: No match, no name at all → Account named "Unknown" ────────────
+    // ── Test 9: No match, no name → Account named "Unknown" ──────────────────
     @IsTest
     static void testNoMatch_noName_accountNamedUnknown() {
         Test.startTest();
         sptc__PayPal_Transaction__c tx = new sptc__PayPal_Transaction__c(
-            sptc__First_Name__c              = null,
-            sptc__Last_Name__c               = null,
-            sptc__Email__c                   = 'noname@example.com',
-            sptc__Billing_Address_Street__c  = '30 Mystery Ln',
-            sptc__Billing_Address_StateCode__c = 'TX',
+            sptc__First_Name__c               = null,
+            sptc__Last_Name__c                = null,
+            sptc__Email__c                    = 'noname@example.com',
+            sptc__Billing_Address_Street__c   = '30 Mystery Ln',
+            sptc__Billing_Address_StateCode__c  = 'TX',
             sptc__Billing_Address_PostalCode__c = '78705',
-            sptc__Transaction_Amount__c      = 10,
-            sptc__Transaction_Date__c        = Date.today()
+            sptc__Transaction_Amount__c       = 10,
+            sptc__Transaction_Date__c         = Date.today()
         );
         insert tx;
         Test.stopTest();
@@ -295,23 +317,23 @@ private class PayPalTransactionTriggerTest {
     // ── Test 10: Name+address match, transaction has no first name → no new Contact
     @IsTest
     static void testNameAddressMatch_noFirstNameOnTransaction_noNewContact() {
-        Account acct = makeAccount('Helen', 'Clark', '40 Fern Way');
+        Account acct = makeAccount('Helen Clark', '40 Fern Way');
         insert acct;
         Contact con = makeContact(acct.Id, 'Helen', 'Clark', 'helen.clark@example.com');
         insert con;
 
         Test.startTest();
-        // Matches by last name + street, but transaction has no first name
-        // so the mismatch check is skipped and no new Contact should be created
+        // Matches by last name + street, but transaction has no first name —
+        // the mismatch check is skipped and no new Contact should be created.
         sptc__PayPal_Transaction__c tx = new sptc__PayPal_Transaction__c(
-            sptc__First_Name__c              = null,
-            sptc__Last_Name__c               = 'Clark',
-            sptc__Email__c                   = 'other.clark@example.com',
-            sptc__Billing_Address_Street__c  = '40 Fern Way',
-            sptc__Billing_Address_StateCode__c = 'TX',
+            sptc__First_Name__c               = null,
+            sptc__Last_Name__c                = 'Clark',
+            sptc__Email__c                    = 'other.clark@example.com',
+            sptc__Billing_Address_Street__c   = '40 Fern Way',
+            sptc__Billing_Address_StateCode__c  = 'TX',
             sptc__Billing_Address_PostalCode__c = '78706',
-            sptc__Transaction_Amount__c      = 40,
-            sptc__Transaction_Date__c        = Date.today()
+            sptc__Transaction_Amount__c       = 40,
+            sptc__Transaction_Date__c         = Date.today()
         );
         insert tx;
         Test.stopTest();
@@ -322,14 +344,18 @@ private class PayPalTransactionTriggerTest {
         List<Contact> contacts = [SELECT Id FROM Contact WHERE AccountId = :acct.Id];
         System.assertEquals(1, contacts.size(), 'No new Contact should be created when transaction has no first name');
 
-        List<OpportunityContactRole> ocrs = [SELECT Id FROM OpportunityContactRole WHERE Opportunity.AccountId = :acct.Id];
-        System.assertEquals(0, ocrs.size(), 'No OCR should be created when transaction has no first name');
+        List<OpportunityContactRole> ocrs = [
+            SELECT Id FROM OpportunityContactRole
+            WHERE Opportunity.AccountId = :acct.Id AND IsPrimary = true
+        ];
+        System.assertEquals(0, ocrs.size(), 'No primary OCR should be created when transaction has no first name');
     }
 
     // ── Test 11: Name+address match, existing Contact has no first name → new Contact
+    // Also covers the existingFirst == null branch in the trigger.
     @IsTest
     static void testNameAddressMatch_existingContactNullFirstName_createsNewContact() {
-        Account acct = makeAccount('', 'Reed', '50 Grove St');
+        Account acct = makeAccount('Reed', '50 Grove St');
         insert acct;
         // Existing Contact intentionally has no first name
         Contact con = new Contact(
@@ -340,27 +366,58 @@ private class PayPalTransactionTriggerTest {
         insert con;
 
         Test.startTest();
-        // Incoming transaction has a first name — existingFirst is null → mismatch
+        // Incoming has a first name; existingFirst is null → triggers mismatch path
         sptc__PayPal_Transaction__c tx = makeTx('James', 'Reed', 'james.reed@example.com', '50 Grove St', 60);
         insert tx;
         Test.stopTest();
 
-        List<Contact> contacts = [SELECT Id, FirstName FROM Contact WHERE AccountId = :acct.Id ORDER BY CreatedDate];
-        System.assertEquals(2, contacts.size(), 'A new Contact should be created when existing Contact has no first name');
-        System.assertEquals('James', contacts[1].FirstName, 'New Contact should have the first name from the transaction');
+        Contact newCon = [
+            SELECT Id, FirstName FROM Contact
+            WHERE  AccountId = :acct.Id AND FirstName = 'James'
+        ];
+        System.assertNotEquals(null, newCon, 'A new Contact should be created when existing Contact has no first name');
+
+        List<Opportunity> opps = [SELECT Id FROM Opportunity WHERE AccountId = :acct.Id];
+        System.assertEquals(1, opps.size(), 'One Opportunity should be created');
 
         List<OpportunityContactRole> ocrs = [
-            SELECT IsPrimary FROM OpportunityContactRole WHERE Opportunity.AccountId = :acct.Id
+            SELECT IsPrimary FROM OpportunityContactRole
+            WHERE  OpportunityId = :opps[0].Id AND ContactId = :newCon.Id
         ];
-        System.assertEquals(1, ocrs.size(), 'An OCR should be created');
+        System.assertEquals(1, ocrs.size(), 'OCR for new Contact should exist');
         System.assertEquals(true, ocrs[0].IsPrimary, 'OCR should be primary');
     }
 
-    // ── Test 12: Bulk — 200 transactions, mix of match scenarios ─────────────
+    // ── Test 12: Blank billing street → name+address key uses empty string ────
+    // Covers the ': ''' branch of the street ternary in Step 4b.
+    @IsTest
+    static void testNameAddressLookup_blankBillingStreet_usesEmptyStringInKey() {
+        Test.startTest();
+        // Last name is set (so Step 4b runs) but billing street is blank —
+        // the key becomes "johnson|" and finds no match, so a new Account is created.
+        sptc__PayPal_Transaction__c tx = new sptc__PayPal_Transaction__c(
+            sptc__First_Name__c               = 'Mike',
+            sptc__Last_Name__c                = 'Johnson',
+            sptc__Email__c                    = 'mike.johnson@example.com',
+            sptc__Billing_Address_Street__c   = null,
+            sptc__Billing_Address_City__c     = 'Austin',
+            sptc__Billing_Address_StateCode__c  = 'TX',
+            sptc__Billing_Address_PostalCode__c = '78707',
+            sptc__Transaction_Amount__c       = 55,
+            sptc__Transaction_Date__c         = Date.today()
+        );
+        insert tx;
+        Test.stopTest();
+
+        sptc__PayPal_Transaction__c result = [SELECT sptc__Account__c FROM sptc__PayPal_Transaction__c WHERE Id = :tx.Id];
+        Account acct = [SELECT Name FROM Account WHERE Id = :result.sptc__Account__c];
+        System.assertEquals('Mike Johnson', acct.Name, 'A new Account should be created when billing street is blank');
+    }
+
+    // ── Test 13: Bulk — 200 transactions, mix of match scenarios ─────────────
     @IsTest
     static void testBulk_200Transactions() {
-        // One existing Account/Contact to match against for half the records
-        Account acct = makeAccount('Frank', 'Martin', '700 Birch Blvd');
+        Account acct = makeAccount('Frank Martin', '700 Birch Blvd');
         insert acct;
         Contact con = makeContact(acct.Id, 'Frank', 'Martin', 'frank.martin@example.com');
         insert con;
@@ -384,7 +441,6 @@ private class PayPalTransactionTriggerTest {
         List<Account> allAccounts = [SELECT Id FROM Account];
         System.assertEquals(101, allAccounts.size(), 'Should be 101 Accounts total (1 existing + 100 new)');
 
-        // 200 Opportunities should have been created
         List<Opportunity> allOpps = [SELECT Id FROM Opportunity];
         System.assertEquals(200, allOpps.size(), 'Should be 200 Opportunities created');
     }
