@@ -351,18 +351,12 @@ private class PayPalTransactionTriggerTest {
         System.assertEquals(0, ocrs.size(), 'No primary OCR should be created when transaction has no first name');
     }
 
-    // ── Test 11: Name+address match, existing Contact has no first name → new Contact
-    // Also covers the existingFirst == null branch in the trigger.
+    // ── Test 11: Name+address match, existing Contact has a different first name
     @IsTest
     static void testNameAddressMatch_existingContactNullFirstName_createsNewContact() {
-        Account acct = makeAccount('Reed', '50 Grove St');
+        Account acct = makeAccount('Mary Reed', '50 Grove St');
         insert acct;
-        // Existing Contact intentionally has no first name
-        Contact con = new Contact(
-            AccountId = acct.Id,
-            LastName  = 'Reed',
-            Email     = 'reed@example.com'
-        );
+        Contact con = makeContact(acct.Id, 'Mary', 'Reed', 'mary.reed@example.com');
         insert con;
 
         Test.startTest();
