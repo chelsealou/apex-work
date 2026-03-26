@@ -382,7 +382,43 @@ private class PayPalTransactionTriggerTest {
         System.assertEquals(true, ocrs[0].IsPrimary, 'OCR should be primary');
     }
 
-    // ── Test 12: Blank billing street → name+address key uses empty string ────
+    // ── Test 12: Name+address match, existing Contact has NO first name → new Contact
+    // Specifically covers the existingFirst == null branch on line 91 of the trigger.
+    @IsTest
+    static void testNameAddressMatch_existingContactHasNoFirstName_createsNewContact() {
+        Account acct = makeAccount('Cooper', '55 Maple Ave');
+        insert acct;
+        // Existing Contact has no first name — existingFirst will be null in the trigger
+        Contact con = new Contact(
+            AccountId = acct.Id,
+            LastName  = 'Cooper',
+            Email     = 'cooper@example.com'
+        );
+        insert con;
+
+        Test.startTest();
+        sptc__PayPal_Transaction__c tx = makeTx('Laura', 'Cooper', 'laura.cooper@example.com', '55 Maple Ave', 70);
+        insert tx;
+        Test.stopTest();
+
+        Contact newCon = [
+            SELECT Id, FirstName FROM Contact
+            WHERE  AccountId = :acct.Id AND FirstName = 'Laura'
+        ];
+        System.assertNotEquals(null, newCon, 'New Contact should be created when existing Contact has no first name');
+
+        List<Opportunity> opps = [SELECT Id FROM Opportunity WHERE AccountId = :acct.Id];
+        System.assertEquals(1, opps.size(), 'One Opportunity should be created');
+
+        List<OpportunityContactRole> ocrs = [
+            SELECT IsPrimary FROM OpportunityContactRole
+            WHERE  OpportunityId = :opps[0].Id AND ContactId = :newCon.Id
+        ];
+        System.assertEquals(1, ocrs.size(), 'OCR for new Contact should exist');
+        System.assertEquals(true, ocrs[0].IsPrimary, 'OCR should be primary');
+    }
+
+    // ── Test 13: Blank billing street → name+address key uses empty string ────
     // Covers the ': ''' branch of the street ternary in Step 4b.
     @IsTest
     static void testNameAddressLookup_blankBillingStreet_usesEmptyStringInKey() {
