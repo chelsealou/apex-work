@@ -54,19 +54,7 @@ private class PayPalTransactionTriggerTest {
         );
     }
 
-    // Removes any OCR that NPSP may have auto-inserted as primary so that
-    // our trigger's IsPrimary OCR can be asserted cleanly.
-    private static void clearNpspOcrs(Id oppId) {
-        List<OpportunityContactRole> existing = [
-            SELECT Id FROM OpportunityContactRole
-            WHERE OpportunityId = :oppId AND IsPrimary = true
-        ];
-        if (!existing.isEmpty()) {
-            delete existing;
-        }
-    }
-
-    // ── Test 1: Email match → existing Account reused, no new Contact ─────────
+// ── Test 1: Email match → existing Account reused, no new Contact ─────────
     @IsTest
     static void testEmailMatch_usesExistingAccount() {
         Account acct = makeAccount('Jane Smith', '100 Main St');
@@ -171,7 +159,7 @@ private class PayPalTransactionTriggerTest {
         System.assertEquals(true, ocrs[0].IsPrimary, 'OCR should be marked primary');
     }
 
-    // ── Test 4: No match at all → new Household Account + Contact created ─────
+    // ── Test 4: No match at all → new Household Account + Contact + Address created
     @IsTest
     static void testNoMatch_createsNewAccount() {
         Test.startTest();
@@ -184,9 +172,8 @@ private class PayPalTransactionTriggerTest {
         ];
         System.assertNotEquals(null, result.sptc__Account__c, 'A new Account should have been created');
 
-        Account newAcct = [SELECT Name, BillingStreet, RecordTypeId FROM Account WHERE Id = :result.sptc__Account__c];
+        Account newAcct = [SELECT Name, RecordTypeId FROM Account WHERE Id = :result.sptc__Account__c];
         System.assertEquals('Carol Taylor', newAcct.Name, 'Account name should be first + last');
-        System.assertEquals('400 Elm St', newAcct.BillingStreet, 'Account street should come from the transaction');
         System.assertEquals(hhRecTypeId, newAcct.RecordTypeId, 'Account should be Household type');
 
         List<Opportunity> opps = [SELECT Amount FROM Opportunity WHERE AccountId = :newAcct.Id];
@@ -199,6 +186,16 @@ private class PayPalTransactionTriggerTest {
         System.assertEquals('Taylor', con.LastName, 'Contact last name should come from the transaction');
         System.assertEquals('carol.taylor@example.com', con.Email, 'Contact email should come from the transaction');
         System.assertEquals(con.Id, result.sptc__Contact__c, 'Transaction Contact lookup should point to the new Contact');
+
+        // An npsp__Address__c record should have been created with the transaction address
+        npsp__Address__c addr = [
+            SELECT npsp__MailingStreet__c, npsp__MailingCity__c, npsp__Default_Address__c
+            FROM   npsp__Address__c
+            WHERE  npsp__Household_Account__c = :newAcct.Id
+            AND    npsp__Default_Address__c = true
+        ];
+        System.assertEquals('400 Elm St', addr.npsp__MailingStreet__c, 'NPSP Address street should come from the transaction');
+        System.assertEquals('Austin', addr.npsp__MailingCity__c, 'NPSP Address city should come from the transaction');
     }
 
     // ── Test 5: Opportunity fields populated correctly ────────────────────────

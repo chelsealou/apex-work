@@ -98,7 +98,10 @@ trigger PayPalTransactionTrigger on sptc__PayPal_Transaction__c (after insert) {
         if (foundAccountId != null) {
             transactionToAccountId.put(pt.Id, foundAccountId);
         } else {
-            // 4c. Build a new Household Account
+            // 4c. Build a new Household Account.
+            // Billing address is NOT set here — it will be written via
+            // npsp__Address__c in Step 4.6 so that NPSP Address Management
+            // owns the address and syncs it correctly to Account and Contact.
             String acctName;
             if (String.isNotBlank(pt.sptc__First_Name__c) && String.isNotBlank(pt.sptc__Last_Name__c)) {
                 acctName = pt.sptc__First_Name__c + ' ' + pt.sptc__Last_Name__c;
@@ -110,17 +113,11 @@ trigger PayPalTransactionTrigger on sptc__PayPal_Transaction__c (after insert) {
                 acctName = 'Unknown';
             }
 
-            Account newAcct = new Account(
-                Name              = acctName,
-                RecordTypeId      = hhRecTypeId,
-                BillingStreet     = pt.sptc__Billing_Address_Street__c,
-                BillingCity       = pt.sptc__Billing_Address_City__c,
-                BillingPostalCode = pt.sptc__Billing_Address_PostalCode__c,
-                BillingState      = pt.sptc__Billing_Address_StateCode__c
-            );
-
             transactionToNewAccountIndex.put(pt.Id, accountsToInsert.size());
-            accountsToInsert.add(newAcct);
+            accountsToInsert.add(new Account(
+                Name         = acctName,
+                RecordTypeId = hhRecTypeId
+            ));
         }
     }
 
@@ -133,15 +130,49 @@ trigger PayPalTransactionTrigger on sptc__PayPal_Transaction__c (after insert) {
         }
     }
 
+    // ── Step 4.6: Create NPSP Address records for new Accounts ───────────────
+    // With NPSP Address Management enabled, addresses must be managed through
+    // npsp__Address__c rather than set directly on Account billing fields.
+    //
+    // This step runs BEFORE the Contact insert (Step 4.5) so that when NPSP's
+    // Contact after-insert trigger fires it finds an existing default address
+    // and syncs it to the Contact's mailing fields — rather than creating a
+    // blank address record and syncing that back, which would clear the
+    // Account's billing address.
+    List<npsp__Address__c> npspAddressesToInsert = new List<npsp__Address__c>();
+
+    for (sptc__PayPal_Transaction__c pt : Trigger.new) {
+        if (!transactionToNewAccountIndex.containsKey(pt.Id)) continue;
+
+        Id accountId = transactionToAccountId.get(pt.Id);
+        if (accountId == null) continue;
+
+        npspAddressesToInsert.add(new npsp__Address__c(
+            npsp__Household_Account__c = accountId,
+            npsp__MailingStreet__c     = pt.sptc__Billing_Address_Street__c,
+            npsp__MailingCity__c       = pt.sptc__Billing_Address_City__c,
+            npsp__MailingPostalCode__c = pt.sptc__Billing_Address_PostalCode__c,
+            npsp__MailingState__c      = pt.sptc__Billing_Address_StateCode__c,
+            npsp__Default_Address__c   = true,
+            npsp__Address_Type__c      = 'Home'
+        ));
+    }
+
+    if (!npspAddressesToInsert.isEmpty()) {
+        insert npspAddressesToInsert;
+    }
+
     // ── Step 4.5: Create Contacts where needed ────────────────────────────────
-    // Two cases require a new Contact at this point:
-    //   (a) Brand-new Account — no Contact exists yet; create one so NPSP can
-    //       establish the household relationship (Account first, then Contact).
-    //   (b) Name-mismatch on an existing Account — different first name on the
-    //       same last name + street; add the new person without changing the
-    //       Account's primary Contact (npe01__One2OneContact__c).
-    List<Contact>    newContactsToInsert     = new List<Contact>();
-    Map<Id, Integer> transactionToNewConIdx  = new Map<Id, Integer>();
+    // Runs after Step 4.6 so the npsp__Address__c already exists when NPSP's
+    // Contact trigger fires. NPSP will sync the address to the Contact's mailing
+    // fields automatically — no need to set them here.
+    //
+    // Two cases:
+    //   (a) Brand-new Account — create the first Contact on the household.
+    //   (b) Name-mismatch on an existing Account — add a new Contact without
+    //       changing the Account's primary Contact (npe01__One2OneContact__c).
+    List<Contact>    newContactsToInsert    = new List<Contact>();
+    Map<Id, Integer> transactionToNewConIdx = new Map<Id, Integer>();
 
     for (sptc__PayPal_Transaction__c pt : Trigger.new) {
         Boolean isNewAccount = transactionToNewAccountIndex.containsKey(pt.Id);
@@ -153,15 +184,11 @@ trigger PayPalTransactionTrigger on sptc__PayPal_Transaction__c (after insert) {
 
         transactionToNewConIdx.put(pt.Id, newContactsToInsert.size());
         newContactsToInsert.add(new Contact(
-            AccountId         = accountId,
-            FirstName         = pt.sptc__First_Name__c,
-            LastName          = String.isNotBlank(pt.sptc__Last_Name__c)
-                                    ? pt.sptc__Last_Name__c : 'Unknown',
-            Email             = pt.sptc__Email__c,
-            MailingStreet     = pt.sptc__Billing_Address_Street__c,
-            MailingCity       = pt.sptc__Billing_Address_City__c,
-            MailingPostalCode = pt.sptc__Billing_Address_PostalCode__c,
-            MailingState      = pt.sptc__Billing_Address_StateCode__c
+            AccountId = accountId,
+            FirstName = pt.sptc__First_Name__c,
+            LastName  = String.isNotBlank(pt.sptc__Last_Name__c)
+                            ? pt.sptc__Last_Name__c : 'Unknown',
+            Email     = pt.sptc__Email__c
         ));
     }
 
@@ -201,7 +228,7 @@ trigger PayPalTransactionTrigger on sptc__PayPal_Transaction__c (after insert) {
         Id accountId = transactionToAccountId.get(pt.Id);
         if (accountId == null) continue;   // should not happen, but guard anyway
 
-        // For first-name-mismatch transactions use the newly created Contact;
+        // For new accounts and mismatch contacts use the newly created Contact;
         // otherwise fall back to the Account's existing primary Contact.
         Id contactId = transactionToNewContactId.containsKey(pt.Id)
             ? transactionToNewContactId.get(pt.Id)
