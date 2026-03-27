@@ -242,9 +242,7 @@ trigger PayPalTransactionTrigger on sptc__PayPal_Transaction__c (after insert) {
         ));
 
         // Build the Opportunity
-        String oppName = String.isNotBlank(pt.sptc__Transaction_ID__c)
-            ? 'PayPal Transaction - ' + pt.sptc__Transaction_ID__c
-            : 'PayPal Transaction - ' + pt.Id;
+        String oppName = 'PayPal Transaction - ' + pt.sptc__Transaction_ID__c;
 
         // CloseDate is required; fall back to today if the transaction date is blank
         Date closeDate = pt.sptc__Transaction_Date__c != null
