@@ -100,11 +100,7 @@ private class PayPalTransactionTriggerTest {
 
         List<Contact> contacts = [SELECT Id FROM Contact WHERE AccountId = :acct.Id];
         System.assertEquals(1, contacts.size(), 'No new Contact should be created when first name matches');
-
-        // NPSP may auto-create a primary OCR for the account's primary Contact —
-        // just verify no *trigger-created* OCR was added for a second contact.
-        List<Contact> contacts = [SELECT Id FROM Contact WHERE AccountId = :acct.Id];
-        System.assertEquals(1, contacts.size(), 'Still only one Contact on the Account');
+        // (NPSP auto-creates a primary OCR for the Account's primary Contact — not asserted here)
     }
 
     // ── Test 3: Name+address match, DIFFERENT first name → new Contact + OCR ──
@@ -153,6 +149,7 @@ private class PayPalTransactionTriggerTest {
             SELECT ContactId, IsPrimary
             FROM   OpportunityContactRole
             WHERE  OpportunityId = :opps[0].Id AND ContactId = :newCon.Id
+            ORDER BY IsPrimary DESC NULLS LAST
         ];
         System.assert(ocrs.size() >= 1, 'OCR for the new Contact should exist');
         System.assertEquals(true, ocrs[0].IsPrimary, 'OCR should be marked primary');
@@ -172,7 +169,7 @@ private class PayPalTransactionTriggerTest {
         System.assertNotEquals(null, result.sptc__Account__c, 'A new Account should have been created');
 
         Account newAcct = [SELECT Name, RecordTypeId FROM Account WHERE Id = :result.sptc__Account__c];
-        System.assertEquals('Carol Taylor', newAcct.Name, 'Account name should be first + last');
+        // NPSP renames the Account after Contact insert (e.g. "Taylor Household") — just verify type
         System.assertEquals(hhRecTypeId, newAcct.RecordTypeId, 'Account should be Household type');
 
         List<Opportunity> opps = [SELECT Amount FROM Opportunity WHERE AccountId = :newAcct.Id];
@@ -270,11 +267,12 @@ private class PayPalTransactionTriggerTest {
         Test.stopTest();
 
         sptc__PayPal_Transaction__c result = [SELECT sptc__Account__c FROM sptc__PayPal_Transaction__c WHERE Id = :tx.Id];
-        Account acct = [SELECT Name FROM Account WHERE Id = :result.sptc__Account__c];
-        System.assertEquals('OnlyLast', acct.Name, 'Account name should be last name only when first name is blank');
+        Account acct = [SELECT Name, RecordTypeId FROM Account WHERE Id = :result.sptc__Account__c];
+        // NPSP renames the Account after Contact insert — just verify it's a Household Account
+        System.assertEquals(hhRecTypeId, acct.RecordTypeId, 'Account should be a Household Account');
 
         Contact con = [SELECT LastName FROM Contact WHERE AccountId = :acct.Id];
-        System.assertEquals('OnlyLast', con.LastName, 'Contact should be created on the new Account');
+        System.assertEquals('OnlyLast', con.LastName, 'Contact last name should come from the transaction');
     }
 
     // ── Test 8: No match, first name only → Account named by first name ───────
@@ -296,8 +294,9 @@ private class PayPalTransactionTriggerTest {
         Test.stopTest();
 
         sptc__PayPal_Transaction__c result = [SELECT sptc__Account__c FROM sptc__PayPal_Transaction__c WHERE Id = :tx.Id];
-        Account acct = [SELECT Name FROM Account WHERE Id = :result.sptc__Account__c];
-        System.assertEquals('OnlyFirst', acct.Name, 'Account name should be first name only when last name is blank');
+        Account acct = [SELECT Name, RecordTypeId FROM Account WHERE Id = :result.sptc__Account__c];
+        // NPSP renames the Account after Contact insert — just verify it's a Household Account
+        System.assertEquals(hhRecTypeId, acct.RecordTypeId, 'Account should be a Household Account');
 
         // Contact LastName falls back to 'Unknown' when last name is blank
         Contact con = [SELECT FirstName, LastName FROM Contact WHERE AccountId = :acct.Id];
@@ -324,8 +323,9 @@ private class PayPalTransactionTriggerTest {
         Test.stopTest();
 
         sptc__PayPal_Transaction__c result = [SELECT sptc__Account__c FROM sptc__PayPal_Transaction__c WHERE Id = :tx.Id];
-        Account acct = [SELECT Name FROM Account WHERE Id = :result.sptc__Account__c];
-        System.assertEquals('Unknown', acct.Name, 'Account name should be Unknown when both names are blank');
+        Account acct = [SELECT Name, RecordTypeId FROM Account WHERE Id = :result.sptc__Account__c];
+        // NPSP renames the Account after Contact insert — just verify it's a Household Account
+        System.assertEquals(hhRecTypeId, acct.RecordTypeId, 'Account should be a Household Account');
 
         Contact con = [SELECT LastName FROM Contact WHERE AccountId = :acct.Id];
         System.assertEquals('Unknown', con.LastName, 'Contact last name should fall back to Unknown');
@@ -361,11 +361,7 @@ private class PayPalTransactionTriggerTest {
 
         List<Contact> contacts = [SELECT Id FROM Contact WHERE AccountId = :acct.Id];
         System.assertEquals(1, contacts.size(), 'No new Contact should be created when transaction has no first name');
-
-        // NPSP may auto-create a primary OCR for the account's primary Contact —
-        // just verify no new trigger-created Contact was added.
-        List<Contact> contacts2 = [SELECT Id FROM Contact WHERE AccountId = :acct.Id];
-        System.assertEquals(1, contacts2.size(), 'Still only one Contact on the Account');
+        // (NPSP auto-creates a primary OCR for the Account's primary Contact — not asserted here)
     }
 
     // ── Test 11: Name+address match, existing Contact has a different first name
@@ -394,6 +390,7 @@ private class PayPalTransactionTriggerTest {
         List<OpportunityContactRole> ocrs = [
             SELECT IsPrimary FROM OpportunityContactRole
             WHERE  OpportunityId = :opps[0].Id AND ContactId = :newCon.Id
+            ORDER BY IsPrimary DESC NULLS LAST
         ];
         System.assert(ocrs.size() >= 1, 'OCR for new Contact should exist');
         System.assertEquals(true, ocrs[0].IsPrimary, 'OCR should be primary');
@@ -430,6 +427,7 @@ private class PayPalTransactionTriggerTest {
         List<OpportunityContactRole> ocrs = [
             SELECT IsPrimary FROM OpportunityContactRole
             WHERE  OpportunityId = :opps[0].Id AND ContactId = :newCon.Id
+            ORDER BY IsPrimary DESC NULLS LAST
         ];
         System.assert(ocrs.size() >= 1, 'OCR for new Contact should exist');
         System.assertEquals(true, ocrs[0].IsPrimary, 'OCR should be primary');
@@ -458,8 +456,10 @@ private class PayPalTransactionTriggerTest {
         Test.stopTest();
 
         sptc__PayPal_Transaction__c result = [SELECT sptc__Account__c FROM sptc__PayPal_Transaction__c WHERE Id = :tx.Id];
-        Account acct = [SELECT Name FROM Account WHERE Id = :result.sptc__Account__c];
-        System.assertEquals('Mike Johnson', acct.Name, 'A new Account should be created when billing street is blank');
+        Account acct = [SELECT Name, RecordTypeId FROM Account WHERE Id = :result.sptc__Account__c];
+        // NPSP renames the Account after Contact insert — verify a Household Account was created
+        System.assertNotEquals(null, acct.Id, 'A new Account should be created when billing street is blank');
+        System.assertEquals(hhRecTypeId, acct.RecordTypeId, 'Account should be a Household Account');
     }
 
     // ── Test 13: Bulk — 200 transactions, mix of match scenarios ─────────────
