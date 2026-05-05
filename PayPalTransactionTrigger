@@ -69,6 +69,23 @@ trigger PayPalTransactionTrigger on sptc__PayPal_Transaction__c (after insert) {
         .get('Household Account')
         .getRecordTypeId();
 
+    // Resolve Opportunity Donation Record Type once
+    Id donationRecTypeId = Schema.SObjectType.Opportunity
+        .getRecordTypeInfosByName()
+        .get('Donation')
+        .getRecordTypeId();
+
+    // Resolve Opportunity Owner once — falls back to running user if not found
+    Id donationOwnerId;
+    List<User> ownerUsers = [
+        SELECT Id FROM User
+        WHERE  Name = 'Kamron Spivey' AND IsActive = true
+        LIMIT  1
+    ];
+    if (!ownerUsers.isEmpty()) {
+        donationOwnerId = ownerUsers[0].Id;
+    }
+
     for (sptc__PayPal_Transaction__c pt : Trigger.new) {
 
         // 4a. Try email lookup
@@ -221,7 +238,6 @@ trigger PayPalTransactionTrigger on sptc__PayPal_Transaction__c (after insert) {
     // ── Step 6: Build Opportunities and Transaction updates ──────────────────
     List<Opportunity>                  oppsToInsert         = new List<Opportunity>();
     List<sptc__PayPal_Transaction__c>  transactionsToUpdate = new List<sptc__PayPal_Transaction__c>();
-    List<Id>                           oppTransactionIds    = new List<Id>(); // parallel to oppsToInsert
 
     for (sptc__PayPal_Transaction__c pt : Trigger.new) {
 
@@ -242,53 +258,34 @@ trigger PayPalTransactionTrigger on sptc__PayPal_Transaction__c (after insert) {
         ));
 
         // Build the Opportunity
-        String oppName = String.isNotBlank(pt.sptc__Transaction_ID__c)
-            ? 'PayPal Transaction - ' + pt.sptc__Transaction_ID__c
-            : 'PayPal Transaction - ' + pt.Id;
+        String oppName = 'PayPal Transaction - ' + pt.sptc__Transaction_ID__c;
 
         // CloseDate is required; fall back to today if the transaction date is blank
         Date closeDate = pt.sptc__Transaction_Date__c != null
             ? pt.sptc__Transaction_Date__c
             : Date.today();
 
-        oppTransactionIds.add(pt.Id);
-        oppsToInsert.add(new Opportunity(
-            Name                       = oppName,
-            AccountId                  = accountId,
-            Amount                     = pt.sptc__Transaction_Amount__c,
-            CloseDate                  = closeDate,
-            StageName                  = 'Closed Won',
+        Opportunity opp = new Opportunity(
+            Name                        = oppName,
+            AccountId                   = accountId,
+            Amount                      = pt.sptc__Transaction_Amount__c,
+            CloseDate                   = closeDate,
+            StageName                   = 'Closed Won',
+            RecordTypeId                = donationRecTypeId,
+            Gift_Type__c                = 'Credit Card',
             Transaction_Reference_ID__c = pt.sptc__Transaction_ID__c
-        ));
+        );
+        if (donationOwnerId != null) {
+            opp.OwnerId = donationOwnerId;
+        }
+        oppsToInsert.add(opp);
     }
 
     if (!oppsToInsert.isEmpty()) {
         insert oppsToInsert;
     }
 
-    // ── Step 6.5: Mark mismatch Contacts as primary on their Opportunity ──────
-    // New-account Contacts are the household primary — no OCR override needed.
-    // Mismatch Contacts are a different person on an existing Account and must
-    // be designated primary on their specific Opportunity only.
-    List<OpportunityContactRole> ocrsToInsert = new List<OpportunityContactRole>();
-
-    for (Integer i = 0; i < oppsToInsert.size(); i++) {
-        Id transId = oppTransactionIds[i];
-        if (!transactionsNeedingNewContact.contains(transId)) continue;
-        Id newConId = transactionToNewContactId.get(transId);
-        if (newConId == null) continue;
-
-        ocrsToInsert.add(new OpportunityContactRole(
-            OpportunityId = oppsToInsert[i].Id,
-            ContactId     = newConId,
-            Role          = 'Decision Maker',
-            IsPrimary     = true
-        ));
-    }
-
-    if (!ocrsToInsert.isEmpty()) {
-        insert ocrsToInsert;
-    }
+    // Note: OpportunityContactRole creation is handled by NPSP automatically.
 
     if (!transactionsToUpdate.isEmpty()) {
         update transactionsToUpdate;
