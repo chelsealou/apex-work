@@ -202,8 +202,12 @@ private class PayPalTransactionTriggerTest {
         insert tx;
         Test.stopTest();
 
+        Id donationRecTypeId = Schema.SObjectType.Opportunity
+            .getRecordTypeInfosByName().get('Donation').getRecordTypeId();
+
         Opportunity opp = [
-            SELECT Name, StageName, Amount, CloseDate, Transaction_Reference_ID__c
+            SELECT Name, StageName, Amount, CloseDate, RecordTypeId,
+                   Gift_Type__c, Transaction_Reference_ID__c
             FROM   Opportunity
             WHERE  Transaction_Reference_ID__c = 'TXN-ABC123'
         ];
@@ -211,6 +215,8 @@ private class PayPalTransactionTriggerTest {
         System.assertEquals('Closed Won', opp.StageName);
         System.assertEquals(123.45, opp.Amount);
         System.assertEquals(Date.newInstance(2026, 1, 15), opp.CloseDate);
+        System.assertEquals(donationRecTypeId, opp.RecordTypeId, 'Opportunity should be Donation record type');
+        System.assertEquals('Credit Card', opp.Gift_Type__c, 'Gift_Type__c should be Credit Card');
     }
 
     // ── Test 6: Blank transaction date → CloseDate defaults to today ──────────

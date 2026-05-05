@@ -69,6 +69,23 @@ trigger PayPalTransactionTrigger on sptc__PayPal_Transaction__c (after insert) {
         .get('Household Account')
         .getRecordTypeId();
 
+    // Resolve Opportunity Donation Record Type once
+    Id donationRecTypeId = Schema.SObjectType.Opportunity
+        .getRecordTypeInfosByName()
+        .get('Donation')
+        .getRecordTypeId();
+
+    // Resolve Opportunity Owner once — falls back to running user if not found
+    Id donationOwnerId;
+    List<User> ownerUsers = [
+        SELECT Id FROM User
+        WHERE  Name = 'Kamron Spivey' AND IsActive = true
+        LIMIT  1
+    ];
+    if (!ownerUsers.isEmpty()) {
+        donationOwnerId = ownerUsers[0].Id;
+    }
+
     for (sptc__PayPal_Transaction__c pt : Trigger.new) {
 
         // 4a. Try email lookup
@@ -248,14 +265,20 @@ trigger PayPalTransactionTrigger on sptc__PayPal_Transaction__c (after insert) {
             ? pt.sptc__Transaction_Date__c
             : Date.today();
 
-        oppsToInsert.add(new Opportunity(
-            Name                       = oppName,
-            AccountId                  = accountId,
-            Amount                     = pt.sptc__Transaction_Amount__c,
-            CloseDate                  = closeDate,
-            StageName                  = 'Closed Won',
+        Opportunity opp = new Opportunity(
+            Name                        = oppName,
+            AccountId                   = accountId,
+            Amount                      = pt.sptc__Transaction_Amount__c,
+            CloseDate                   = closeDate,
+            StageName                   = 'Closed Won',
+            RecordTypeId                = donationRecTypeId,
+            Gift_Type__c                = 'Credit Card',
             Transaction_Reference_ID__c = pt.sptc__Transaction_ID__c
-        ));
+        );
+        if (donationOwnerId != null) {
+            opp.OwnerId = donationOwnerId;
+        }
+        oppsToInsert.add(opp);
     }
 
     if (!oppsToInsert.isEmpty()) {
